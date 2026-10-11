@@ -130,20 +130,100 @@ echo "[i] KernelPackage/nft-queue 定义位置:"
 grep -n 'define KernelPackage/nft-queue' package/kernel/linux/modules/netfilter.mk || true
 
 # ---------------------------------------------------------------------------
+# 4.5 让内核配置一次性稳定（关键！见 README「坑 8」）
+#
+# ⚠️ 坑：iStoreOS 的 config-<ver> 是给旧内核准备的。当源码树内核版本较新时
+#     （如 6.12.94 新增了 CONFIG_TRANSPARENT_HUGEPAGE_NEVER 这个 choice 成员），
+#     内核 syncconfig 会在非交互环境遇到 NEW 项，卡在
+#         "Restart config...  choice[1-3?]: "
+#     读不到 stdin 而报错退出：
+#         scripts/kconfig/Makefile:85: syncconfig Error 1
+#         Makefile:769: include/config/auto.conf.cmd: No such file or directory
+#     表现为 target/linux/compile 与 package/kernel/linux/compile 双双"秒退"失败。
+#
+#     修复：用默认值补齐所有 NEW 项（olddefconfig）。
+#     注意 olddefconfig 需要内核 build_dir 已存在 —— 而它由 target/linux/compile
+#     首次创建。所以流程是：先试跑 target/linux → 生成内核目录 → olddefconfig → 重跑。
+# ---------------------------------------------------------------------------
+step "4.5/6 稳定内核配置（补齐 NEW 项，避免 syncconfig 卡死）"
+
+prepare_kernel_dir() {
+    # 试跑 target/linux/compile 以生成内核构建目录（预期可能在此失败）
+    set +e
+    make -j"$NPROC" target/linux/compile >/tmp/kprep.log 2>&1
+    set -e
+    ls -d "$SRC_DIR"/build_dir/target-*/linux-*/linux-* 2>/dev/null | head -1
+}
+
+fix_kernel_config() {
+    local kdir="$1"
+    [ -n "$kdir" ] && [ -d "$kdir" ] || return 1
+
+    local tc_bin
+    tc_bin="$(ls -d "$SRC_DIR"/staging_dir/toolchain-*/bin 2>/dev/null | head -1)"
+    [ -n "$tc_bin" ] && export PATH="$tc_bin:$SRC_DIR/staging_dir/host/bin:$PATH"
+
+    if ! command -v aarch64-openwrt-linux-musl-gcc >/dev/null 2>&1; then
+        echo "[!] 工具链不在 PATH，无法执行 olddefconfig"
+        return 1
+    fi
+
+    echo "[i] 内核构建目录: $kdir"
+    echo "[i] 工具链: $(aarch64-openwrt-linux-musl-gcc --version | head -1)"
+    # yes "" 提供空行，使任何残留交互提示都取默认值
+    set +e
+    ( cd "$kdir" && yes "" | make ARCH=arm64 \
+        CROSS_COMPILE=aarch64-openwrt-linux-musl- olddefconfig 2>&1 | tail -10 )
+    local rc=$?
+    set -e
+    echo "[i] olddefconfig rc=$rc，关键项校验:"
+    ( cd "$kdir" && grep -nE '^CONFIG_(NFT_QUEUE|TRANSPARENT_HUGEPAGE)' .config ) || true
+    return $rc
+}
+
+KDIR="$(ls -d "$SRC_DIR"/build_dir/target-*/linux-*/linux-* 2>/dev/null | head -1)"
+if [ -z "$KDIR" ]; then
+    echo "[i] 内核目录不存在，先试跑一次 target/linux/compile 生成它"
+    KDIR="$(prepare_kernel_dir)"
+fi
+
+if [ -n "$KDIR" ]; then
+    fix_kernel_config "$KDIR" || echo "[!] 内核配置稳定化未成功，5.3 可能失败"
+else
+    echo "[!] 仍无法定位内核目录，跳过（5.3 若报 syncconfig 错误即为此因）"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. 编译
 # ---------------------------------------------------------------------------
 step "5/6 开始编译 (NPROC=$NPROC)"
-echo "--- 5.1 download ---"
-make -j"$NPROC" download 2>&1 | tail -15
 
-echo "--- 5.2 toolchain/install ---"
-make -j"$NPROC" toolchain/install 2>&1 | tail -30
+# ⚠️ 注意：下面每步都显式捕获 make 的退出码。
+#     不要写成 `make ... | tail -N` 后检查 $? —— 那取到的是 tail 的退出码，恒为 0，
+#     会掩盖真实失败（本项目实测踩过这个坑）。
+run_make() {
+    local label="$1"; shift
+    local logf="/build/${label//\//_}.log"
+    echo "--- $label ---"
+    set +e
+    make "$@" > "$logf" 2>&1
+    local rc=$?
+    set -e
+    tail -25 "$logf"
+    if [ "$rc" -ne 0 ]; then
+        echo "!!! $label 失败 (rc=$rc)，完整日志: $logf"
+        echo "!!! 末 60 行："
+        tail -60 "$logf"
+        BUILD_FAILED=1
+    fi
+    return $rc
+}
 
-echo "--- 5.3 target/linux/compile ---"
-make -j"$NPROC" target/linux/compile 2>&1 | tail -30
-
-echo "--- 5.4 package/kernel/linux/compile ---"
-make -j"$NPROC" package/kernel/linux/compile 2>&1 | tail -50
+BUILD_FAILED=0
+run_make "5.1 download" -j"$NPROC" download || true
+run_make "5.2 toolchain/install" -j"$NPROC" toolchain/install || { echo "[x] toolchain 失败，后续无法继续"; exit 1; }
+run_make "5.3 target/linux/compile" -j"$NPROC" target/linux/compile || echo "[!] target/linux 失败，仍尝试 package/kernel"
+run_make "5.4 package/kernel/linux/compile" -j"$NPROC" package/kernel/linux/compile || true
 
 # ---------------------------------------------------------------------------
 # 6. 收集产物
