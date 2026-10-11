@@ -1,0 +1,187 @@
+name: Build kmod-nft-queue for iStoreOS (Phicomm N1)
+
+# =============================================================================
+#  为 iStoreOS 25.12 (amlogic/meson, 内核 6.12) 交叉编译 nftables 的 queue 模块
+#  产物：nft_queue.ko + kmod-nft-queue 安装包
+#
+#  触发方式：
+#    - Push 到 main 且改动 scripts/ docker/ .github/ 时
+#    - 手动触发（可自定义分支 / 并行度 / Docker Hub 拉取）
+# =============================================================================
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'scripts/**'
+      - 'docker/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      istoreos_branch:
+        description: 'iStoreOS 源码分支'
+        required: true
+        default: 'istoreos-25.12'
+      nproc:
+        description: '并行编译度（GitHub runner 建议 2~4，过高会 OOM）'
+        required: true
+        default: '4'
+      use_prebuilt_image:
+        description: '从 GHCR 拉取预构建镜像（更快，镜像不存在则自动回退本地构建）'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nft-queue-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: istoreos-builder
+  IMAGE_TAG: 25.12
+  ISTOREOS_BRANCH: ${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }}
+  NPROC: ${{ github.event.inputs.nproc || '4' }}
+
+jobs:
+  build:
+    name: Cross-compile nft_queue.ko
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350          # 首次全量编译 toolchain 需 2~4 小时，给足预算
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间（runner 默认只有 ~14G 可用，OpenWrt 全量构建需 25G+）
+        run: |
+          echo "===== 清理前 ====="; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get clean
+          docker image prune -af 2>/dev/null || true
+          echo "===== 清理后 ====="; df -h /
+
+      - name: 设置构建缓存（dl 源码包 + ccache）
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/dl
+            cache/ccache
+          key: istoreos-${{ env.ISTOREOS_BRANCH }}-dl-${{ hashFiles('scripts/build-module.sh') }}
+          restore-keys: |
+            istoreos-${{ env.ISTOREOS_BRANCH }}-dl-
+
+      - name: 准备构建目录（绑定到容器 /build）
+        run: |
+          mkdir -p build cache/dl cache/ccache out
+          cp -v scripts/build-module.sh build/
+          chmod +x build/build-module.sh
+          # 把缓存目录挂进容器共享
+          ls -la build cache
+
+      # ---------------------------------------------------------------------
+      # 镜像：优先用预构建镜像，失败则本地构建
+      # ---------------------------------------------------------------------
+      - name: 尝试拉取预构建镜像
+        id: pull
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_prebuilt_image }}
+        continue-on-error: true
+        run: |
+          IMG="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+          docker pull "$IMG" && \
+            docker tag "$IMG" "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" && \
+            echo "pulled=true" >> "$GITHUB_OUTPUT" || echo "pulled=false" >> "$GITHUB_OUTPUT"
+
+      - name: 本地构建镜像（拉取失败时）
+        if: steps.pull.outputs.pulled != 'true'
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --build-arg TARGET_BRANCH=${{ env.ISTOREOS_BRANCH }} \
+            .
+
+      - name: 启动编译容器
+        run: |
+          docker run -d --name builder \
+            --network host \
+            -e BRANCH="${{ env.ISTOREOS_BRANCH }}" \
+            -e NPROC="${{ env.NPROC }}" \
+            -e OUT_DIR=/build/out \
+            -e SRC_DIR=/build/istoreos \
+            -v "$PWD/build:/build" \
+            -v "$PWD/cache/dl:/build/istoreos-dl-ro:ro" \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            sleep infinity
+          docker ps -a
+
+      - name: 预置 dl 缓存（符号链接过去，避免重复下载源码包）
+        run: |
+          docker exec builder bash -c '
+            set -e
+            mkdir -p /build/istoreos
+            # iStoreOS 在仓库根目录用 dl/ 存放源码包；先把缓存落地再链接
+            if [ -d /build/istoreos-dl-ro ] && [ -n "$(ls -A /build/istoreos-dl-ro 2>/dev/null)" ]; then
+              echo "[i] 复用缓存的源码包"
+              mkdir -p /build/istoreos/dl
+              cp -rn /build/istoreos-dl-ro/. /build/istoreos/dl/ 2>/dev/null || true
+              ls /build/istoreos/dl | head
+            else
+              echo "[i] 无缓存，稍后全量下载"
+            fi
+          '
+
+      - name: 执行交叉编译
+        run: |
+          docker exec \
+            -e BRANCH="${{ env.ISTOREOS_BRANCH }}" \
+            -e NPROC="${{ env.NPROC }}" \
+            builder bash -lc 'bash /build/build-module.sh 2>&1 | tee /build/build.log'
+          # 退出码由脚本保证：找不到 .ko 即非 0
+
+      - name: 回写 dl 缓存
+        if: always()
+        run: |
+          mkdir -p cache/dl
+          docker exec builder bash -c '
+            [ -d /build/istoreos/dl ] && cp -rn /build/istoreos/dl/. /build/istoreos-dl-ro/ 2>/dev/null || true
+          ' || true
+          du -sh cache/dl || true
+
+      - name: 校验产物 vermagic
+        if: success()
+        run: |
+          echo "===== 产物列表 ====="
+          ls -la out/
+          echo
+          echo "===== vermagic 校验（期望：6.12.94 SMP mod_unload aarch64）====="
+          for f in out/*.ko; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            strings "$f" | grep -E '^vermagic=' || echo "(未找到 vermagic)"
+          done
+
+      - name: 上传产物 Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmod-nft-queue-${{ env.ISTOREOS_BRANCH }}-${{ github.run_number }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 失败时输出编译日志
+        if: failure()
+        run: |
+          echo "===== /build/build.log（末 200 行）====="
+          docker exec builder bash -c 'tail -200 /build/build.log' 2>/dev/null || \
+            docker logs builder 2>&1 | tail -200 || true
+
+      - name: 清理容器
+        if: always()
+        run: docker rm -f builder 2>/dev/null || true

@@ -1,0 +1,19 @@
+# 构建产物
+out/
+build/
+cache/
+*.ko
+*.apk
+*.ipk
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地凭据（切勿提交）
+*.env
+.env.local
+secrets/
