@@ -249,6 +249,358 @@ vermagic 形如 `6.12.94 SMP mod_unload aarch64`。只要用 `istoreos-25.12` �
 
 > ⚠️ **唯一的残余风险**：`Unknown symbol`（模块引用了目标内核没编进去的符号）。这个只能在 N1 上 `insmod` 那一刻才知道，所以 `install-on-n1.sh` 里专门做了友好报错。
 
+### 8. 内核 `syncconfig` 卡死（本项目第二个致命坑）
+
+**症状**：`target/linux/compile` 和 `package/kernel/linux/compile` **双双在 1 秒内秒退**，日志末尾是：
+
+```
+* Restart config...
+* Transparent Hugepage Support
+Transparent Hugepage Support (TRANSPARENT_HUGEPAGE) [Y/n/?] y
+    3. never (TRANSPARENT_HUGEPAGE_NEVER) (NEW)
+  choice[1-3?]: make[7]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+make[6]: *** [Makefile:691: syncconfig] Error 2
+Makefile:769: include/config/auto.conf.cmd: No such file or directory
+    ERROR: target/linux failed to build.
+```
+
+**根因**：iStoreOS 的 `target/linux/amlogic/meson/config-6.12` 是给**旧版内核**准备的。源码树里的内核是 **6.12.94**，比该配置更新，新增了 `CONFIG_TRANSPARENT_HUGEPAGE_NEVER` 这个 choice 成员。kconfig 在 `syncconfig` 阶段发现 NEW 项，非交互环境下读不到 stdin 就报错退出。
+
+> 注意：**不是** `CONFIG_NFT_QUEUE=m` 引起的。任何触发 `.config` 重算的改动（包括修好 `FORCE_UNSAFE_CONFIGURE` 后第一次能跑到这一步）都会暴露它。
+
+**修复**：编译前用默认值补齐所有 NEW 项：
+
+```bash
+cd build_dir/target-*/linux-*/linux-*/
+export PATH="$PWD/../../../staging_dir/toolchain-*/bin:$PWD/../../../staging_dir/host/bin:$PATH"
+yes "" | make ARCH=arm64 CROSS_COMPILE=aarch64-openwrt-linux-musl- olddefconfig
+```
+
+- `yes ""` 提供空行，使任何残留的交互提示都取默认值
+- 必须先把**交叉工具链 bin 与 host bin 放进 PATH**，否则报
+  `scripts/Kconfig.include:40: C compiler 'aarch64-openwrt-linux-musl-gcc' not found`
+- 修复后 `CONFIG_TRANSPARENT_HUGEPAGE_NEVER is not set` 被补上，`CONFIG_NFT_QUEUE=m` 保留
+
+`build-module.sh` 的 **4.5 步**自动做这件事（幂等，可重复执行）。
+
+### 9. `make ... | tail -N` 会掩盖失败退出码
+
+```bash
+# ❌ $? 取到的是 tail 的退出码，恒为 0 —— 失败被静默吞掉
+make -j8 target/linux/compile 2>&1 | tail -40
+echo "rc=$?"          # 永远打印 rc=0
+
+# ✅ 显式捕获 make 的退出码
+make -j8 target/linux/compile > build.log 2>&1
+rc=$?
+tail -25 build.log
+```
+
+本项目实测踩过：第一次跑完后日志显示 `### 3 rc=0 ###`，看起来一切正常，实际上
+`target/linux` 已经失败了。**排查这类问题时务必用 `V=s` 单独复现，不要只看批量日志。**
+
+### 10. 观察长时间编译的正确姿势
+
+`make ... | tail -N` 会把输出缓冲到命令结束，所以**编译过程中 log 尾部看不到任何细节**。
+要看真实进度必须直接读文件系统：
+
+```bash
+# 内核编译进度（目标文件数会持续增长）
+find build_dir/target-*/linux-*/linux-*/ -name '*.o' | wc -l
+# netfilter 目录（nft_queue.c 在这里编译）
+ls build_dir/target-*/linux-*/linux-*/net/netfilter/*.o | wc -l
+# 工具链产出
+ls staging_dir/toolchain-*/bin | wc -l
+# 子步骤目录按时间排序，可看出编到哪一步
+ls -lt build_dir/toolchain-*/
+```
+
+工具链子步骤的固定顺序：
+`binutils` → `gcc-initial` → `gdb` → `kernel-headers` → `musl` → `gcc-final`
+（`gcc-final` 最耗时，8 核约 30–50 分钟）
+
+### 11. ★ 模块必须带 `.BTF`，否则 `insmod` 段错误（本项目第一致命坑）
+
+**这是我们踩得最深的一个坑，v0.1 的模块 vermagic 完全正确却装不上，原因就在这里。**
+
+iStoreOS 官方内核编译时开启了 BTF 调试信息（`CONFIG_DEBUG_INFO_BTF=y`）。内核在
+`load_module()` 里会解析模块的 `.BTF` 段；如果模块**没有** `.BTF`（或 BTF 为空/非法），
+就会在 `caches_clean_inval_pou` 里对一个非法地址范围做 cache 清理 → Oops / 段错误。
+
+#### 症状
+
+模块 vermagic 完全匹配，`modinfo` 也正常，但：
+
+```console
+# insmod nft_queue.ko
+Segmentation fault
+```
+
+```console
+# dmesg | tail
+nft_queue: module has no kallsyms
+pc : caches_clean_inval_pou+0x30/0x84
+lr : load_module+0xef0/0x1b54
+Call trace:
+ caches_clean_inval_pou+0x30/0x84
+ __do_sys_init_module
+Code: d2800084 9ac52084 d1000485 8a250042 (d50b7b22)   # dc civac
+```
+
+`caches_clean_inval_pou` + `dc civac`（data cache clean and invalidate）是关键线索：
+内核对一个**空/非法** BTF 缓冲区做 cache 操作。
+
+#### 诊断方法（决定性证据）
+
+N1 内核配置（权威来源 `/proc/config.gz`）：
+
+```
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+CONFIG_MODULE_ALLOW_BTF_MISMATCH=y
+CONFIG_DEBUG_INFO=y
+# CONFIG_DEBUG_INFO_REDUCED is not set      ← 关键
+CONFIG_PAHOLE_VERSION=131
+```
+
+N1 上存在 `/sys/kernel/btf/vmlinux`（约 5 MB）。
+抽样 `/lib/modules/6.12.94/` 下 **25/25 个系统模块都带 `.BTF` 段**。
+（N1 是 busybox，没有 `readelf`；把 `.ko` 拷到编译容器里查即可。）
+
+对比我们产出的模块，用 `readelf -S -W`：
+
+```
+# 系统模块 nft_quota.ko
+[27] .BTF  PROGBITS  off=000cf1  size=001a9d     ← 有
+
+# 我们编的 nft_queue.ko
+（没有 .BTF 段）                                  ← 没有 ⇒ insmod 必崩
+```
+
+#### 根因：三层配置缺一不可
+
+**① iStoreOS 顶层 `.config` 用 `CONFIG_KERNEL_*` 前缀，不是裸 `CONFIG_DEBUG_INFO_*`**
+
+裸写 `CONFIG_DEBUG_INFO_BTF=y` 会被 `make defconfig` 直接清掉。必须写：
+
+```
+CONFIG_KERNEL_DEBUG_INFO=y
+# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+CONFIG_KERNEL_DEBUG_INFO_BTF=y
+CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
+CONFIG_DWARVES=y
+CONFIG_KERNEL_TRANSPARENT_HUGEPAGE_NEVER=y
+```
+
+**② 依赖链决定了必须先关 `REDUCED`**
+
+`config/Config-kernel.in`：
+
+```
+config KERNEL_DEBUG_INFO_BTF
+        bool "Enable BTF debug information"
+        depends on KERNEL_DEBUG_INFO && !KERNEL_DEBUG_INFO_REDUCED
+config KERNEL_DEBUG_INFO_BTF_MODULES
+        depends on KERNEL_DEBUG_INFO_BTF
+```
+
+iStoreOS 默认 `CONFIG_KERNEL_DEBUG_INFO_REDUCED=y`，所以在结构上 **BTF 不可能被选中**。
+必须先把 `REDUCED` 关掉。
+
+**③ 还要改内核「种子文件」，只改顶层不够**
+
+`target/linux/generic/config-6.12` 里显式写死了 `# CONFIG_DEBUG_INFO_BTF is not set`，
+这个文件在内核 `make defconfig` 时会被直接采用。所以必须同时改：
+
+```bash
+# target/linux/generic/config-6.12 与 target/linux/amlogic/config-6.12
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+CONFIG_MODULE_ALLOW_BTF_MISMATCH=y
+# CONFIG_DEBUG_INFO_REDUCED is not set
+# CONFIG_DEBUG_INFO_NONE is not set
+```
+
+#### ④ `pahole` 必须是 OpenWrt 自带那份（1.31）
+
+BTF 由 `pahole` 生成。内核期望 `CONFIG_PAHOLE_VERSION=131`，即 **1.31**。
+Debian bookworm 仓库里只有 **1.24**，偏低。正确做法是用
+`tools/dwarves`（`PKG_VERSION:=1.31`，由 `CONFIG_DWARVES=y` 触发）：
+
+```bash
+make -j"$(nproc)" tools/dwarves/compile
+export PATH="$SRC_DIR/staging_dir/host/bin:$PATH"
+pahole --version     # → v1.31
+```
+
+`tools/dwarves/Makefile` 编译需要宿主机具备：`cmake`、`ninja-build`、`libdw-dev`
+（本项目的 Dockerfile 已包含）。
+
+#### 清理步骤
+
+改完配置后**必须删掉内核 build_dir 的 `.config`**，否则旧的（无 BTF 的）配置会被复用：
+
+```bash
+KDIR=$(ls -d build_dir/target-*/linux-*/linux-* | head -1)
+rm -f "$KDIR/.config" "$KDIR/.config.old"
+make -j"$(nproc)" target/linux/compile
+```
+
+验证生效：
+
+```bash
+grep -E 'DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|PAHOLE_VERSION' "$KDIR/.config"
+# 期望：
+#   CONFIG_PAHOLE_VERSION=131
+#   # CONFIG_DEBUG_INFO_REDUCED is not set
+#   CONFIG_DEBUG_INFO_BTF=y
+#   CONFIG_DEBUG_INFO_BTF_MODULES=y
+```
+
+最终产物校验（`build-module.sh` 第 7 步已内置）：
+
+```bash
+readelf -S -W out/nft_queue.ko | grep '\.BTF'
+# 必须出现，例如：[27] .BTF PROGBITS ... size=001a9d
+```
+
+#### 顺带解决：`syncconfig` 死锁
+
+在种子文件里预填 `CONFIG_TRANSPARENT_HUGEPAGE_NEVER=y`（并 unset
+`ALWAYS`/`MADVISE`），可以一并消除坑 8 描述的
+`choice[1-3?]:` + `syncconfig Error 1` 死锁 —— 因为 6.12 新增的这个 choice
+成员已经在种子文件里有值了，不再算 NEW。
+
+### 12. ★ `struct module` 布局必须与目标内核一致，否则 `load_module` 静默死循环
+
+**这是比 BTF 更根本的一个坑。** 即使模块带了正确的 `.BTF`，只要 `struct module`
+布局不一致，`insmod` 仍会**静默挂死**（进程永远处于 `S` 状态，无 dmesg、无返回、
+系统负载正常）。
+
+#### 症状
+
+```console
+# insmod nft_queue.ko
+（无任何输出，命令永不返回）
+```
+
+```console
+# ps | grep insmod
+17714 root  1656 S  insmod /tmp/nftq2/btf_nft_queue.ko    ← 永远 S 状态
+# cat /proc/loadavg
+0.02 0.08 0.08 1/303                                ← 系统完全健康
+# dmesg | tail
+（没有任何新行）
+```
+
+多次尝试会**累积多个卡死的 insmod 进程**，必须手工 `kill -9` 清理，否则干扰后续诊断。
+
+#### 诊断方法
+
+`struct module` 在目标内核里的实际大小 vs 我们编出来的：
+
+```bash
+# 目标内核的 struct module 大小（可从任意系统模块读出）
+readelf -sW /lib/modules/6.12.94/nft_quota.ko | awk '$NF=="__this_module"{print $3}'
+#   → 1216
+
+# 我们模块的
+readelf -sW out/nft_queue.ko | awk '$NF=="__this_module"{print $3}'
+#   → 704        ← 差 512 字节！
+```
+
+也可以直接读用我们的内核编出的模块的 `.gnu.linkonce.this_module` 段大小：
+`1216`（0x4c0）vs `704`（0x2c0）。
+
+#### 根因：一批 tracing / perf / kprobe / BPF 选项缺失
+
+`struct module` 里有大量 `#ifdef` 字段（见 `include/linux/module.h`）。以下选项
+在目标（iStoreOS 官方）内核里是 `=y`，而我们默认构建里 **完全没有或为 n**：
+
+| 选项 | N1 内核 | 默认构建 | 贡献的 `struct module` 字段 |
+|---|---|---|---|
+| `CONFIG_TRACEPOINTS` | y | — | `tracepoints[]` 数组 |
+| `CONFIG_TRACING` | y | — | — |
+| `CONFIG_EVENT_TRACING` | y | — | — |
+| `CONFIG_FTRACE` | y | **n** | `ftrace_callsites` 等 |
+| `CONFIG_KPROBES` | y | **n** | kprobe 数组 |
+| `CONFIG_KPROBE_EVENTS` | y | — | — |
+| `CONFIG_BPF_EVENTS` | y | — | BPF event 字段 |
+| `CONFIG_PERF_EVENTS` | y | **n** | perf event 字段 |
+
+内核在 `load_module` 里按**它自己的** `struct module` 布局读我们模块的
+`__this_module`（在 `.gnu.linkonce.this_module` 段里，由模块在**编译时**按
+**自己的**布局填好）。布局不一致 → 读到垃圾的 `num_tracepoints`/`num_kprobes`
+→ 在这些数组上无限循环 → 静默挂死。
+
+`CONFIG_MODULE_ALLOW_BTF_MISMATCH=y` 只容忍 BTF 不匹配，**不管 struct 布局**。
+
+#### 修复
+
+**① 顶层 `.config`（`CONFIG_KERNEL_*` 前缀）**
+
+```bash
+CONFIG_KERNEL_PERF_EVENTS=y
+CONFIG_KERNEL_FTRACE=y
+CONFIG_KERNEL_KPROBES=y
+CONFIG_KERNEL_BPF_EVENTS=y
+```
+
+用 `./scripts/config` 或直接 `sed` 改最稳；`make defconfig` 之后这 4 项会保留
+（因为它们被彼此 `select` 成一组，不会全部落空）。
+
+⚠️ 注意：**不要**把它们只写进 `target/linux/generic/config-6.12` 就以为够了 ——
+顶层 `.config` 才是 OpenWrt 的权威来源；两处都写最保险。
+
+**② 内核种子文件（可选双保险）**
+
+`target/linux/generic/config-6.12`：
+
+```
+CONFIG_PERF_EVENTS=y
+CONFIG_HW_PERF_EVENTS=y
+CONFIG_FTRACE=y
+CONFIG_TRACING=y
+CONFIG_TRACEPOINTS=y
+CONFIG_EVENT_TRACING=y
+CONFIG_DYNAMIC_EVENTS=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_KRETPROBES=y
+CONFIG_BPF_EVENTS=y
+CONFIG_UPROBES=y
+CONFIG_UPROBE_EVENTS=y
+CONFIG_GENERIC_TRACER=y
+CONFIG_TRACE_CLOCK=y
+CONFIG_STACKTRACE=y
+```
+
+**③ 触发内核重新生成 `.config`**
+
+不要直接 `rm` 内核 build_dir 的 `.config`（OpenWrt 的 `target/linux/compile`
+会因为 `.config` 缺失而报 `No rule to make target '.../linux-6.12.94/.config'`）。
+正确做法是删除它的**标记文件**：
+
+```bash
+KDIR=$(ls -d build_dir/target-*/linux-*/linux-* | head -1)
+rm -f "$KDIR/.configured"
+make -j"$(nproc)" target/linux/compile
+```
+
+#### 验证
+
+```bash
+# 内核侧
+grep -E '^CONFIG_(TRACEPOINTS|TRACING|EVENT_TRACING|FTRACE|KPROBES|KPROBE_EVENTS|BPF_EVENTS|PERF_EVENTS)=' "$KDIR/.config"
+# 期望全部 =y
+
+# 模块侧（700 → 1216 才是对的）
+readelf -sW out/nft_queue.ko | awk '$NF=="__this_module"{print "this_module =",$3}'
+```
+
+本项目实测：补齐这 8 项后，`__this_module` 从 **704 → 1216**，与目标内核完全一致。
+
 ---
 
 ## 仓库结构

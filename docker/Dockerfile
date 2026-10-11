@@ -38,6 +38,10 @@ RUN set -eux; \
     rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 
 # ---- OpenWrt 官方 build-dep 清单（debian 变体）----
+#   额外加入 BTF 相关工具链依赖：
+#     cmake / ninja-build  → 编 OpenWrt 自带 pahole (tools/dwarves)
+#     libdw-dev            → pahole 依赖 elfutils/libdw
+#   注：不要用 Debian 的 dwarves 包（pahole 1.24 太旧），内核期望 PAHOLE_VERSION=131。
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -47,7 +51,8 @@ RUN set -eux; \
         python3-dev python3-venv rsync subversion swig time unzip wget zlib1g-dev \
         quilt patch bzip2 xz-utils cpio bc flex bison autoconf automake libtool pkg-config \
         gperf zip kmod libfuse-dev fakeroot sudo less vim-tiny ca-certificates \
-        device-tree-compiler u-boot-tools; \
+        device-tree-compiler u-boot-tools \
+        cmake ninja-build libdw-dev; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
