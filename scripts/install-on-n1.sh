@@ -37,9 +37,17 @@ case "$SRC" in
         ok "apk 安装完成"
         ;;
   *.ipk)
-        info "检测到 ipk 包，使用 opkg 安装"
-        opkg install "$SRC" || die "opkg 安装失败"
-        ok "ipk 安装完成"
+        # iStoreOS 25.12 起默认使用 apk；旧版本才需要 opkg
+        if command -v apk >/dev/null 2>&1; then
+            info "系统使用 apk，改用 apk 安装 ipk"
+            apk add --allow-untrusted "$SRC" || die "apk 安装失败"
+        elif command -v opkg >/dev/null 2>&1; then
+            info "检测到 ipk 包，使用 opkg 安装"
+            opkg install "$SRC" || die "opkg 安装失败"
+        else
+            die "系统既无 apk 也无 opkg，无法安装 $SRC"
+        fi
+        ok "包安装完成"
         ;;
   *.ko)
         # -------------------------------------------------------------------
@@ -110,6 +118,11 @@ $(zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_(MODVERSIONS|MODULE_SIG|NF_
         cp -f "$SRC" "$MODDIR/extra/nft_queue.ko"
         sync
         ok "已复制到 $MODDIR/extra/nft_queue.ko"
+
+        # 重建依赖索引，使 modprobe 能按名找到
+        if command -v depmod >/dev/null 2>&1; then
+            depmod -a "$KVER" 2>/dev/null && ok "depmod 已更新依赖索引" || echo "[!] depmod 执行失败（不影响 insmod）"
+        fi
 
         # 5. 开机自动加载
         mkdir -p /etc/modules.d /etc/modules-boot.d 2>/dev/null || true
