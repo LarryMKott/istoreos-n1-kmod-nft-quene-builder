@@ -82,7 +82,14 @@ GitHub Actions (ubuntu-22.04, x86_64)
    - **首次全量编译需要 2~4 小时**（要编整个 aarch64 toolchain），之后有 dl 缓存会快一些
    - 完成后在 `Artifacts` 下载 `kmod-nft-queue-istoreos-25.12-<run_number>`
 
-4. **装到 N1**：见下方
+4. **直接下 Release**（编译成功会自动发布）
+   - 每次成功编译后自动创建/更新 GitHub Release：
+     `kmod-nft-queue-istoreos-25.12-k6.12.94`
+   - 附件包含 `nft_queue.ko`、`kmod-nft-queue-*.apk`、`SHA256SUMS.txt`
+   - Release 正文里会写清 vermagic / `.BTF` / `__this_module` 三项自检值，方便对账
+   - 同内核版本重跑会覆盖已有 Release 的附件（不会堆一堆重名 tag）
+
+5. **装到 N1**：见下方
 
 ### 方式 B：本地 / 自建服务器跑
 

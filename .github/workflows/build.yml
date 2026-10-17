@@ -33,7 +33,7 @@ on:
         default: true
 
 permissions:
-  contents: read
+  contents: write         # 创建 Release 需要
   packages: read          # 拉取 GHCR 上的预构建镜像需要
 
 concurrency:
@@ -231,6 +231,7 @@ jobs:
           key: ${{ steps.dlcache.outputs.cache-primary-key }}
 
       - name: 校验产物 vermagic
+        id: verify
         if: success()
         run: |
           echo "===== 产物列表（宿主 out/，与容器 /build/out 是同一目录）====="
@@ -246,6 +247,74 @@ jobs:
             echo "--- $f ---"
             strings "$f" | grep -E '^vermagic=' || echo "(未找到 vermagic)"
           done
+
+          # 提取发布所需信息，供后面的 Release 步骤用
+          KO="$(ls out/*.ko | head -1)"
+          KVER="$(strings "$KO" | sed -n 's/^vermagic=\([^ ]*\).*/\1/p' | head -1)"
+          BTF="$(readelf -S -W "$KO" | awk '$2==".BTF"{print $6}' | head -1)"
+          TM="$(readelf -sW "$KO" | awk '$NF=="__this_module"{print $3}' | head -1)"
+          echo "kver=${KVER:-unknown}"                 >> "$GITHUB_OUTPUT"
+          echo "btf=${BTF:-NONE}"                      >> "$GITHUB_OUTPUT"
+          echo "this_module=${TM:-NONE}"               >> "$GITHUB_OUTPUT"
+          echo "[i] kernel=$KVER  .BTF=$BTF  __this_module=$TM"
+
+      - name: 生成校验和与发布说明
+        id: notes
+        if: success()
+        run: |
+          ( cd out && rm -f SHA256SUMS.txt && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          # ⚠️ heredoc 未加引号 ⇒ 会做变量替换，因此正文里禁止出现反引号（会被当命令执行）
+          cat > release-notes.md <<EOF
+          # kmod-nft-queue for iStoreOS / Phicomm N1
+
+          **nft_queue.ko** —— nftables 的 queue 模块，aarch64 交叉编译产物，
+          用于 iStoreOS ${ISTOREOS_BRANCH}（内核 ${{ steps.verify.outputs.kver }}）。
+
+          ## 产物
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | nft_queue.ko | 内核模块，直接 insmod，或放进 /lib/modules/\$(uname -r)/ |
+          | kmod-nft-queue-*.apk | iStoreOS 25.12 安装包（apk add --allow-untrusted） |
+          | SHA256SUMS.txt | 校验和 |
+
+          ## 产物自检
+
+          | 项 | 值 | 期望 |
+          | --- | --- | --- |
+          | vermagic | ${{ steps.verify.outputs.kver }} SMP mod_unload aarch64 | 与设备 uname -r 一致 |
+          | .BTF 段 | ${{ steps.verify.outputs.btf }} | 非 NONE（否则 insmod Oops） |
+          | __this_module | ${{ steps.verify.outputs.this_module }} | 1216 |
+
+          ## 构建信息
+
+          - iStoreOS 分支：${ISTOREOS_BRANCH}
+          - 提交：${GITHUB_SHA}
+          - Workflow run：[#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          安装与故障排查见仓库 README。
+          EOF
+          echo "----- release-notes.md -----"; cat release-notes.md
+
+      - name: 创建 GitHub Release
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="kmod-nft-queue-${ISTOREOS_BRANCH}-k${{ steps.verify.outputs.kver }}"
+          echo "[i] release tag: $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "[i] Release 已存在，覆盖产物与说明"
+            gh release upload "$TAG" out/* --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" out/* \
+              --title "kmod-nft-queue · ${ISTOREOS_BRANCH} · kernel ${{ steps.verify.outputs.kver }}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+          echo "### Release: [$TAG](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/$TAG)" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[] | .name+"  "+((.size/1024)|tostring)+" KB")'
 
       - name: 上传产物 Artifact
         if: success()
