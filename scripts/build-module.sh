@@ -274,7 +274,7 @@ if [ "$ENABLE_BTF" = "1" ]; then
         kcfg_unset "$f" CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
         kcfg_unset "$f" CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
         echo "[i]   $f ->"
-        grep -nE 'DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|^CONFIG_DEBUG_INFO=|TRANSPARENT_HUGEPAGE' "$f" | sed 's/^/      /'
+        grep -nE 'DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|^CONFIG_DEBUG_INFO=|TRANSPARENT_HUGEPAGE' "$f" | sed 's/^/      /' || true
     done
 else
     echo "[i] ENABLE_BTF=0，跳过 BTF（产出的模块可能无法 insmod）"
@@ -435,7 +435,7 @@ echo "关键内核配置（内核 build_dir 的 .config）:"
 _kdir="$(first_kernel_dir)"
 if [ -n "$_kdir" ] && [ -f "$_kdir/.config" ]; then
     grep -E '^CONFIG_(TRACEPOINTS|TRACING|EVENT_TRACING|FTRACE|KPROBES|KPROBE_EVENTS|BPF_EVENTS|PERF_EVENTS|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|PAHOLE_VERSION)=' \
-        "$_kdir/.config" | sed 's/^/  /'
+        "$_kdir/.config" | sed 's/^/  /' || true
 fi
 
 if ! ls "$OUT_DIR"/*.ko >/dev/null 2>&1; then
