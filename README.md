@@ -640,6 +640,14 @@ Certificate verification failed: The certificate is NOT trusted.
 > 附带一个坑：GHCR 包默认是 **private**，`build.yml` 里如果匿名 `docker pull` 会 401。
 > 本项目已加 `permissions: packages: read` + `GITHUB_TOKEN` 登录步骤。
 
+#### (c) 容器 `/build` 是宿主 `build/`，产物不会出现在 `out/`
+
+`docker run -v "$PWD/build:/build"` 意味着容器里的 `/build/out` 其实是宿主 `build/out`，
+而 workflow 的 `upload-artifact` 找的是仓库根目录的 `out/` —— 结果就是
+**编译成功、日志里明明列着 `nft_queue.ko 551432 字节`，上传却报 `No files were found with the provided path: out/*`**。
+
+修法：给容器额外显式挂一层 `-v "$PWD/out:/build/out"`，让 `/build/out` 直接落在宿主 `out/`。
+
 ---
 
 ## 仓库结构

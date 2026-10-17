@@ -74,8 +74,11 @@ jobs:
           docker image prune -af 2>/dev/null || true
           echo "===== 清理后 ====="; df -h /
 
-      - name: 设置构建缓存（dl 源码包 + ccache）
-        uses: actions/cache@v4
+      # ⚠️ 不能用 actions/cache@v4：它在 job 失败时 Post 步骤会被 skip，缓存直接丢失。
+      #    这里显式 restore + save(always)，让一次 70 分钟编译下载的源码包能留到下一次。
+      - name: 恢复构建缓存（dl 源码包 + ccache）
+        id: dlcache
+        uses: actions/cache/restore@v4
         with:
           path: |
             cache/dl
@@ -159,6 +162,7 @@ jobs:
             -e SRC_DIR=/build/istoreos \
             -e CCACHE_DIR=/build/ccache \
             -v "$PWD/build:/build" \
+            -v "$PWD/out:/build/out" \
             -v "$PWD/cache/dl:/build/dl-cache" \
             -v "$PWD/cache/ccache:/build/ccache" \
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
@@ -216,11 +220,25 @@ jobs:
           ' || true
           du -sh cache/dl || true
 
+      - name: 保存构建缓存
+        if: always() && steps.dlcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            cache/dl
+            cache/ccache
+          key: ${{ steps.dlcache.outputs.cache-primary-key }}
+
       - name: 校验产物 vermagic
         if: success()
         run: |
-          echo "===== 产物列表 ====="
+          echo "===== 产物列表（宿主 out/，与容器 /build/out 是同一目录）====="
           ls -la out/
+          if ! ls out/*.ko >/dev/null 2>&1; then
+            echo "::error::out/ 里没有 .ko —— 编译脚本可能成功但产物没落到挂载目录"
+            exit 1
+          fi
           echo
           echo "===== vermagic 校验（期望：6.12.x SMP mod_unload aarch64）====="
           for f in out/*.ko; do
