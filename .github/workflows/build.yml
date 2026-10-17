@@ -180,13 +180,31 @@ jobs:
             fi
           '
 
+      - name: 环境自检
+        run: |
+          echo "===== 磁盘 ====="; df -h /
+          echo "===== 内存 ====="; free -m
+          echo "===== 容器内工具 ====="
+          docker exec builder bash -lc 'set -x; git --version; make --version | head -1; nproc; df -h /build | tail -1' || true
+
       - name: 执行交叉编译
         run: |
+          # ⚠️ 必须 pipefail：容器里 `script | tee log` 的退出码是 tee 的（恒 0），
+          #    会把真实失败吞掉，只剩「上传产物: No files were found」这种二次报错。
           docker exec \
             -e BRANCH="${{ env.ISTOREOS_BRANCH }}" \
             -e NPROC="${{ env.NPROC }}" \
-            builder bash -lc 'bash /build/build-module.sh 2>&1 | tee /build/build.log'
-          # 退出码由脚本保证：找不到 .ko 即非 0
+            builder bash -lc 'set -o pipefail; bash /build/build-module.sh 2>&1 | tee /build/build.log'
+
+      - name: 编译日志摘要
+        if: always()
+        run: |
+          for f in build/build.log build/feeds.log build/pahole.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f（末 120 行）====="
+            tail -120 "$f"
+            echo
+          done
 
       - name: 回写 dl 缓存
         if: always()
@@ -233,8 +251,8 @@ jobs:
           done
           docker exec builder bash -c 'tail -200 /build/build.log' 2>/dev/null || true
 
-      - name: 失败时上传日志
-        if: failure()
+      - name: 上传构建日志 Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_number }}

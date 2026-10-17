@@ -88,14 +88,29 @@ kcfg_unset() { # kcfg_unset <file> <KEY>
 # 1. 取源码
 # ---------------------------------------------------------------------------
 step "1/7 克隆 iStoreOS 源码 (branch=$BRANCH)"
+echo "[i] 磁盘: $(df -h / | awk 'NR==2{print $4" 可用 / "$2" 总量"}')"
+echo "[i] 内存: $(free -m 2>/dev/null | awk '/Mem:/{print $7" MB available"}')"
+echo "[i] git: $(git --version)"
 mkdir -p /build
 if [ -d "$SRC_DIR/.git" ]; then
     echo "[i] 源码已存在，更新中"
     git -C "$SRC_DIR" fetch --depth=1 origin "$BRANCH"
     git -C "$SRC_DIR" checkout -q FETCH_HEAD
 else
-    git clone --depth=1 -b "$BRANCH" \
-        https://github.com/istoreos/istoreos.git "$SRC_DIR"
+    # 大仓库浅克隆偶发 HTTP/2 中断（RPC failed / index-pack failed），重试 3 次
+    ok=0
+    for attempt in 1 2 3; do
+        rm -rf "$SRC_DIR"
+        echo "[i] clone 第 ${attempt}/3 次…"
+        if git -c http.postBuffer=524288000 -c http.lowSpeedLimit=0 -c http.lowSpeedTime=999999 \
+               clone --depth=1 --single-branch --branch "$BRANCH" \
+               https://github.com/istoreos/istoreos.git "$SRC_DIR"; then
+            ok=1; break
+        fi
+        echo "[!] clone 失败（第 $attempt 次），10s 后重试"
+        sleep 10
+    done
+    [ "$ok" = "1" ] || { echo "[x] git clone 连续 3 次失败"; exit 1; }
 fi
 git -C "$SRC_DIR" log --oneline -1
 echo "[i] HEAD=$(git -C "$SRC_DIR" rev-parse HEAD)"
@@ -106,8 +121,21 @@ cd "$SRC_DIR"
 # 2. feeds
 # ---------------------------------------------------------------------------
 step "2/7 更新并安装 feeds"
-./scripts/feeds update -a 2>&1 | tail -15
-./scripts/feeds install -a 2>&1 | tail -10
+# 输出同时落盘 feeds.log，便于 CI 失败时定位（原来只 tail 到 stdout，日志拿不到）
+feeds_retry() {   # feeds_retry <logfile> [feeds 参数...]
+    local log="$1"; shift
+    local r=1 i
+    for i in 1 2 3; do
+        echo "[i] ./scripts/feeds $* 第 $i 次…"
+        if ./scripts/feeds "$@" > "$log" 2>&1; then r=0; break; fi
+        echo "[!] feeds $* 失败，末 20 行："; tail -20 "$log"
+        sleep 5
+    done
+    tail -15 "$log"
+    return $r
+}
+feeds_retry /build/feeds.log         update  -a || { echo "[x] feeds update 失败"; exit 1; }
+feeds_retry /build/feeds-install.log install -a || { echo "[x] feeds install 失败"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 3. 种子 .config + defconfig

@@ -17,3 +17,6 @@ Thumbs.db
 *.env
 .env.local
 secrets/
+
+# 本地工作数据（勿提交）
+.workbuddy/
