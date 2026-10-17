@@ -69,7 +69,8 @@ GitHub Actions (ubuntu-22.04, x86_64)
 
 2. **首次**：让 Actions 构建好编译镜像
    - 打开 `Actions` → `Publish builder image to GHCR` → `Run workflow`
-   - 等它跑完（约 5~8 分钟），镜像会推到 `ghcr.io/<你的用户名>/istoreos-n1-kmod-nft-queue-builder/istoreos-builder:25.12`
+   - 等它跑完（约 5~8 分钟），镜像会推到 `ghcr.io/<你的用户名全小写>/istoreos-n1-kmod-nft-quene-builder/istoreos-builder:25.12`
+     （镜像名必须全小写，见「坑 13」；workflow 会自动把仓库名转成小写）
    - 如果跳过这步也没关系，`build.yml` 会检测不到镜像并**本地构建**
 
 3. **编译模块**
@@ -600,6 +601,44 @@ readelf -sW out/nft_queue.ko | awk '$NF=="__this_module"{print "this_module =",$
 ```
 
 本项目实测：补齐这 8 项后，`__this_module` 从 **704 → 1216**，与目标内核完全一致。
+
+---
+
+### 13. CI 上两个「秒挂」的坑（镜像名大小写 / slim 镜像没有 CA 证书）
+
+这两个都不属于编译逻辑错误，但会让 GitHub Actions 在 20 秒内红掉。
+
+#### (a) Docker 镜像名必须全小写
+
+`${{ github.repository }}` 保留仓库的**原始大小写**（本仓库是 `LarryMKott/...`），
+直接拼到 tag 上会被 registry 拒绝：
+
+```
+ERROR: failed to build: invalid tag "ghcr.io/LarryMKott/istoreos-n1-kmod-nft-quene-builder/istoreos-builder:25.12":
+repository name must be lowercase
+```
+
+正确做法是在 workflow 里先算小写名：
+
+```yaml
+- id: img
+  run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/istoreos-builder" >> "$GITHUB_OUTPUT"
+```
+
+#### (b) `debian:12-slim` 里没有 `ca-certificates`
+
+`slim` 镜像不带 CA 根证书，把 apt 源换成 `https://` 后第一条 `RUN` 就会挂：
+
+```
+Certificate verification failed: The certificate is NOT trusted.
+```
+
+表现：`本地构建镜像` 这一步 20 秒内失败，日志里连 apt 包列表都没开始装。
+修法（本项目 Dockerfile 已采用）：**apt 源统一走 `http://`**（apt 有 GPG 签名校验，
+不依赖 TLS），并在同一层里装 `ca-certificates`；同时保留清华/官方/阿里/腾讯多源回退。
+
+> 附带一个坑：GHCR 包默认是 **private**，`build.yml` 里如果匿名 `docker pull` 会 401。
+> 本项目已加 `permissions: packages: read` + `GITHUB_TOKEN` 登录步骤。
 
 ---
 

@@ -2,6 +2,11 @@ name: Publish builder image to GHCR
 
 # 构建编译环境镜像并推到 GitHub Container Registry，
 # 让 build.yml 可以直接 pull，省掉每次 3~5 分钟的 apt 安装。
+#
+# ⚠️ 坑：Docker / OCI 镜像名必须全小写。`github.repository` 保留仓库原始大小写
+#    （本仓库是 LarryMKott/...），直接拼进 tag 会报：
+#      invalid tag "ghcr.io/LarryMKott/...:25.12": repository name must be lowercase
+#    因此这里先算出小写名再使用。
 
 on:
   push:
@@ -15,10 +20,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/istoreos-builder
-
 jobs:
   publish:
     runs-on: ubuntu-22.04
@@ -26,13 +27,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 计算小写镜像名
+        id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/istoreos-builder" >> "$GITHUB_OUTPUT"
+
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -43,7 +48,17 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:25.12
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ steps.img.outputs.image }}:25.12
+            ${{ steps.img.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: 输出镜像地址
+        run: |
+          echo "### 预构建镜像已推送" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.img.outputs.image }}:25.12" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.img.outputs.image }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "[i] 若 build.yml 拉取时提示 unauthorized/denied，" \
+               "到 Packages 设置里把该包可见性改为 Public（或让 build.yml 用 GITHUB_TOKEN 登录，已默认支持）。"

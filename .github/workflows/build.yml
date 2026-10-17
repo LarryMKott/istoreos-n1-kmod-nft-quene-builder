@@ -33,7 +33,8 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
+  packages: read          # 拉取 GHCR 上的预构建镜像需要
 
 concurrency:
   group: build-nft-queue-${{ github.ref }}
@@ -44,6 +45,7 @@ env:
   IMAGE_TAG: 25.12
   ISTOREOS_BRANCH: ${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }}
   NPROC: ${{ github.event.inputs.nproc || '4' }}
+  USE_PREBUILT: ${{ github.event_name != 'workflow_dispatch' || inputs.use_prebuilt_image }}
 
 jobs:
   build:
@@ -54,6 +56,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ⚠️ Docker / OCI 镜像名必须全小写，而 github.repository 保留仓库原始大小写
+      #    （本仓库 LarryMKott/...），直接拼会报 repository name must be lowercase。
+      - name: 计算小写镜像名
+        id: img
+        run: |
+          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY,,}/istoreos-builder" >> "$GITHUB_OUTPUT"
 
       - name: 释放磁盘空间（runner 默认只有 ~14G 可用，OpenWrt 全量构建需 25G+）
         run: |
@@ -80,31 +89,65 @@ jobs:
           mkdir -p build cache/dl cache/ccache out
           cp -v scripts/build-module.sh build/
           chmod +x build/build-module.sh
-          # 把缓存目录挂进容器共享
           ls -la build cache
 
       # ---------------------------------------------------------------------
       # 镜像：优先用预构建镜像，失败则本地构建
       # ---------------------------------------------------------------------
-      - name: 尝试拉取预构建镜像
-        id: pull
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_prebuilt_image }}
+      - name: 登录 GHCR（读取预构建镜像）
+        if: env.USE_PREBUILT == 'true'
         continue-on-error: true
         run: |
-          IMG="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin || \
+            echo "[!] GHCR 登录失败，将尝试匿名拉取"
+
+      - name: 尝试拉取预构建镜像
+        id: pull
+        if: env.USE_PREBUILT == 'true'
+        continue-on-error: true
+        run: |
+          IMG="${{ steps.img.outputs.ghcr }}:${{ env.IMAGE_TAG }}"
           echo "img=$IMG" >> "$GITHUB_OUTPUT"
-          docker pull "$IMG" && \
-            docker tag "$IMG" "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" && \
-            echo "pulled=true" >> "$GITHUB_OUTPUT" || echo "pulled=false" >> "$GITHUB_OUTPUT"
+          if docker pull "$IMG"; then
+            docker tag "$IMG" "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+            echo "pulled=true" >> "$GITHUB_OUTPUT"
+            echo "[i] 已使用预构建镜像: $IMG"
+          else
+            echo "pulled=false" >> "$GITHUB_OUTPUT"
+            echo "[!] 预构建镜像不可用，改为本地构建"
+          fi
+
+      # Docker Hub 匿名拉取偶发 429（rate limit），失败时换镜像源重试
+      - name: 预拉取基础镜像（带镜像源回退）
+        if: steps.pull.outputs.pulled != 'true'
+        run: |
+          for src in \
+            docker.io/library/debian:12-slim \
+            mirror.gcr.io/library/debian:12-slim \
+            public.ecr.aws/docker/library/debian:12-slim ; do
+            echo "[i] 尝试: $src"
+            if docker pull "$src"; then
+              docker tag "$src" debian:12-slim
+              echo "[i] 基础镜像就绪（来自 $src）"
+              exit 0
+            fi
+            echo "[!] 失败，换下一个源"
+          done
+          echo "[x] 基础镜像全部拉取失败"; exit 1
 
       - name: 本地构建镜像（拉取失败时）
         if: steps.pull.outputs.pulled != 'true'
+        env:
+          DOCKER_BUILDKIT: '1'
         run: |
-          docker build \
+          set -o pipefail
+          docker build --progress=plain \
             -f docker/Dockerfile \
             -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
             --build-arg TARGET_BRANCH=${{ env.ISTOREOS_BRANCH }} \
-            .
+            . 2>&1 | tee docker-build.log
+          echo "[i] 镜像构建完成"
 
       - name: 启动编译容器
         run: |
@@ -114,22 +157,23 @@ jobs:
             -e NPROC="${{ env.NPROC }}" \
             -e OUT_DIR=/build/out \
             -e SRC_DIR=/build/istoreos \
+            -e CCACHE_DIR=/build/ccache \
             -v "$PWD/build:/build" \
-            -v "$PWD/cache/dl:/build/istoreos-dl-ro:ro" \
+            -v "$PWD/cache/dl:/build/dl-cache" \
+            -v "$PWD/cache/ccache:/build/ccache" \
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
             sleep infinity
           docker ps -a
 
-      - name: 预置 dl 缓存（符号链接过去，避免重复下载源码包）
+      - name: 预置 dl 缓存（避免重复下载源码包）
         run: |
           docker exec builder bash -c '
             set -e
             mkdir -p /build/istoreos
-            # iStoreOS 在仓库根目录用 dl/ 存放源码包；先把缓存落地再链接
-            if [ -d /build/istoreos-dl-ro ] && [ -n "$(ls -A /build/istoreos-dl-ro 2>/dev/null)" ]; then
+            if [ -d /build/dl-cache ] && [ -n "$(ls -A /build/dl-cache 2>/dev/null)" ]; then
               echo "[i] 复用缓存的源码包"
               mkdir -p /build/istoreos/dl
-              cp -rn /build/istoreos-dl-ro/. /build/istoreos/dl/ 2>/dev/null || true
+              cp -rn /build/dl-cache/. /build/istoreos/dl/ 2>/dev/null || true
               ls /build/istoreos/dl | head
             else
               echo "[i] 无缓存，稍后全量下载"
@@ -147,9 +191,10 @@ jobs:
       - name: 回写 dl 缓存
         if: always()
         run: |
-          mkdir -p cache/dl
           docker exec builder bash -c '
-            [ -d /build/istoreos/dl ] && cp -rn /build/istoreos/dl/. /build/istoreos-dl-ro/ 2>/dev/null || true
+            if [ -d /build/istoreos/dl ] && [ -d /build/dl-cache ]; then
+              cp -rn /build/istoreos/dl/. /build/dl-cache/ 2>/dev/null || true
+            fi
           ' || true
           du -sh cache/dl || true
 
@@ -159,7 +204,7 @@ jobs:
           echo "===== 产物列表 ====="
           ls -la out/
           echo
-          echo "===== vermagic 校验（期望：6.12.94 SMP mod_unload aarch64）====="
+          echo "===== vermagic 校验（期望：6.12.x SMP mod_unload aarch64）====="
           for f in out/*.ko; do
             [ -f "$f" ] || continue
             echo "--- $f ---"
@@ -175,12 +220,29 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: 失败时输出编译日志
+      # 失败可能发生在「镜像构建」阶段（此时容器还没起来，build.log 不存在），
+      # 因此把镜像构建日志一并落盘并输出。
+      - name: 失败时输出日志
         if: failure()
         run: |
-          echo "===== /build/build.log（末 200 行）====="
-          docker exec builder bash -c 'tail -200 /build/build.log' 2>/dev/null || \
-            docker logs builder 2>&1 | tail -200 || true
+          for f in docker-build.log build/pahole.log build/build.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f（末 200 行）====="
+            tail -200 "$f"
+            echo
+          done
+          docker exec builder bash -c 'tail -200 /build/build.log' 2>/dev/null || true
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            docker-build.log
+            build/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: 清理容器
         if: always()
