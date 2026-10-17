@@ -60,6 +60,22 @@ export FORCE_UNSAFE_CONFIGURE=1
 
 step() { echo; echo "==================== $* ===================="; }
 
+# ⚠️ set -e 下脚本一旦失败会静默退出（配合 workflow 里的 tee 更是完全看不到原因），
+#    这里装个 ERR 陷阱，至少把出错行号和退出码打出来。
+trap '_rc=$?; echo "[x] 构建脚本在第 ${LINENO} 行失败（rc=$_rc），上一行输出即失败现场" >&2' ERR
+
+# 安全获取第一个内核 build_dir。
+# ⚠️ 不能写成 `ls -d .../linux-* | head -1`：首次编译时目录还不存在，
+#    ls 返回 2，配合 `set -o pipefail` 会让整条管线返回 2，
+#    赋值语句 `X="$(...)"` 随即被 set -e 判定失败 → 脚本静默退出（本项目实测踩过）。
+first_kernel_dir() {
+    local d
+    for d in "$SRC_DIR"/build_dir/target-*/linux-*/linux-*; do
+        [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Kconfig 文件读写小工具
 # ---------------------------------------------------------------------------
@@ -67,7 +83,9 @@ kcfg_set() {   # kcfg_set <file> <KEY> <val>
     local f="$1" k="$2" v="$3"
     [ -f "$f" ] || return 0
     if grep -qE "^# ?${k} is not set" "$f"; then
-        sed -i "s|^# ?${k} is not set|${k}=${v}|" "$f"
+        # ⚠️ 必须 sed -E：BRE 里 `?` 是字面量，不匹配 "# CONFIG_XXX is not set"，
+        #    会导致「文件里明明有 is not set 却改不动」（本项目实测踩过）。
+        sed -i -E "s|^# *${k} is not set|${k}=${v}|" "$f"
     elif grep -qE "^${k}=" "$f"; then
         sed -i "s|^${k}=.*|${k}=${v}|" "$f"
     else
@@ -313,7 +331,7 @@ grep -nE '^CONFIG_(PERF_EVENTS|FTRACE|TRACING|TRACEPOINTS|EVENT_TRACING|KPROBES|
 #        "No rule to make target '.../.config'"。删 .configured 标记即可。
 # ---------------------------------------------------------------------------
 step "4.6/7 触发内核 .config 重新生成"
-KDIR_PRE="$(ls -d "$SRC_DIR"/build_dir/target-*/linux-*/linux-* 2>/dev/null | head -1)"
+KDIR_PRE="$(first_kernel_dir)"
 if [ -n "$KDIR_PRE" ]; then
     rm -f "$KDIR_PRE/.configured" "$KDIR_PRE/.config.prev" 2>/dev/null || true
     echo "[i] 已删除 $KDIR_PRE/.configured"
@@ -399,14 +417,14 @@ for f in "$OUT_DIR"/*.ko; do
     echo "  $f"
     strings "$f" 2>/dev/null | grep -E '^vermagic=' || true
     if [ "$ENABLE_BTF" = "1" ]; then
-        btf_size="$(readelf -S -W "$f" 2>/dev/null | awk '$2==".BTF"{print $6; fnd=1} END{if(!fnd) print "NONE"}')"
+        btf_size="$(readelf -S -W "$f" 2>/dev/null | awk '$2==".BTF"{print $6; fnd=1} END{if(!fnd) print "NONE"}' || true)"
         echo "    .BTF = $btf_size"
         if [ "$btf_size" = "NONE" ]; then
             echo "    [x] 缺少 .BTF！该模块在 iStoreOS 上 insmod 会 Oops"
         fi
     fi
     # struct module 大小（必须等于目标内核的 1216；704 说明 tracing 选项没打开）
-    tm="$(readelf -sW "$f" 2>/dev/null | awk '$NF=="__this_module"{print $3; fnd=1} END{if(!fnd) print "NONE"}')"
+    tm="$(readelf -sW "$f" 2>/dev/null | awk '$NF=="__this_module"{print $3; fnd=1} END{if(!fnd) print "NONE"}' || true)"
     echo "    __this_module size = $tm   (目标内核应为 1216)"
     if [ "$tm" != "NONE" ] && [ "$tm" -lt 1216 ] 2>/dev/null; then
         echo "    [x] struct module 布局偏小 → tracing/perf/kprobes/bpf-events 未对齐，insmod 会静默挂死"
@@ -414,7 +432,7 @@ for f in "$OUT_DIR"/*.ko; do
 done
 echo
 echo "关键内核配置（内核 build_dir 的 .config）:"
-_kdir="$(ls -d "$SRC_DIR"/build_dir/target-*/linux-*/linux-* 2>/dev/null | head -1)"
+_kdir="$(first_kernel_dir)"
 if [ -n "$_kdir" ] && [ -f "$_kdir/.config" ]; then
     grep -E '^CONFIG_(TRACEPOINTS|TRACING|EVENT_TRACING|FTRACE|KPROBES|KPROBE_EVENTS|BPF_EVENTS|PERF_EVENTS|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|PAHOLE_VERSION)=' \
         "$_kdir/.config" | sed 's/^/  /'
